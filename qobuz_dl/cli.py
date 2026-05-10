@@ -1,5 +1,4 @@
 import configparser
-import hashlib
 import logging
 import glob
 import os
@@ -29,9 +28,8 @@ QOBUZ_DB = os.path.join(CONFIG_PATH, "qobuz_dl.db")
 def _reset_config(config_file):
     logging.info(f"{YELLOW}Creating config file: {config_file}")
     config = configparser.ConfigParser()
-    config["DEFAULT"]["email"] = input("Enter your email:\n- ")
-    password = input("Enter your password\n- ")
-    config["DEFAULT"]["password"] = hashlib.md5(password.encode("utf-8")).hexdigest()
+    config["DEFAULT"]["user_id"] = ""
+    config["DEFAULT"]["user_auth_token"] = ""
     config["DEFAULT"]["default_folder"] = (
         input("Folder for downloads (leave empty for default 'Qobuz Downloads')\n- ")
         or "Qobuz Downloads"
@@ -40,9 +38,9 @@ def _reset_config(config_file):
         input(
             "Download quality (5, 6, 7, 27) "
             "[320, LOSSLESS, 24B <96KHZ, 24B >96KHZ]"
-            "\n(leave empty for default '6')\n- "
+            "\n(leave empty for default '27')\n- "
         )
-        or "6"
+        or "27"
     )
     config["DEFAULT"]["default_limit"] = "20"
     config["DEFAULT"]["no_m3u"] = "false"
@@ -56,6 +54,7 @@ def _reset_config(config_file):
     bundle = Bundle()
     config["DEFAULT"]["app_id"] = str(bundle.get_app_id())
     config["DEFAULT"]["secrets"] = ",".join(bundle.get_secrets().values())
+    config["DEFAULT"]["private_key"] = bundle.get_private_key() or ""
     config["DEFAULT"]["folder_format"] = DEFAULT_FOLDER
     config["DEFAULT"]["track_format"] = DEFAULT_TRACK
     config["DEFAULT"]["smart_discography"] = "false"
@@ -66,6 +65,7 @@ def _reset_config(config_file):
         "\nso you don't have to call custom flags every time you run "
         "a qobuz-dl command."
     )
+    return config
 
 
 def _remove_leftovers(directory):
@@ -77,6 +77,24 @@ def _remove_leftovers(directory):
             pass
 
 
+def _save_token(config_file, token_info):
+    config = configparser.ConfigParser()
+    config.read(config_file)
+    if "DEFAULT" not in config:
+        config["DEFAULT"] = {}
+    if token_info.get("user_id"):
+        config["DEFAULT"]["user_id"] = str(token_info["user_id"])
+    if token_info.get("user_auth_token"):
+        config["DEFAULT"]["user_auth_token"] = token_info["user_auth_token"]
+    if token_info.get("app_id"):
+        config["DEFAULT"]["app_id"] = str(token_info["app_id"])
+    if token_info.get("app_secret"):
+        config["DEFAULT"]["secrets"] = token_info["app_secret"]
+    with open(config_file, "w") as configfile:
+        config.write(configfile)
+    logging.info(f"{GREEN}OAuth token saved to {config_file}")
+
+
 def _handle_commands(qobuz, arguments):
     try:
         if arguments.command == "dl":
@@ -86,6 +104,17 @@ def _handle_commands(qobuz, arguments):
             qobuz.lucky_type = arguments.type
             qobuz.lucky_limit = arguments.number
             qobuz.lucky_mode(query)
+        elif arguments.command == "oauth":
+            token_info = qobuz.handle_oauth_login(
+                arguments.CODE_OR_URL,
+                listen=arguments.listen,
+                manual=arguments.manual,
+                callback_url=arguments.oauth_callback,
+                bind_host=arguments.oauth_host,
+                bind_port=arguments.oauth_port,
+            )
+            if token_info:
+                _save_token(CONFIG_FILE, token_info)
         else:
             qobuz.interactive_limit = arguments.limit
             qobuz.interactive()
@@ -103,21 +132,27 @@ def _handle_commands(qobuz, arguments):
 def _initial_checks():
     if not os.path.isdir(CONFIG_PATH) or not os.path.isfile(CONFIG_FILE):
         os.makedirs(CONFIG_PATH, exist_ok=True)
-        _reset_config(CONFIG_FILE)
+        if "-r" not in sys.argv and "--reset" not in sys.argv:
+            _reset_config(CONFIG_FILE)
 
     if len(sys.argv) < 2:
         sys.exit(qobuz_dl_args().print_help())
 
 
 def main():
+    if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+        sys.exit(qobuz_dl_args().print_help())
+
     _initial_checks()
 
     config = configparser.ConfigParser()
     config.read(CONFIG_FILE)
 
     try:
-        email = config["DEFAULT"]["email"]
-        password = config["DEFAULT"]["password"]
+        if not config.defaults() and ("-r" in sys.argv or "--reset" in sys.argv):
+            raise KeyError("config missing; reset requested")
+        user_id = config["DEFAULT"].get("user_id", "")
+        user_auth_token = config["DEFAULT"].get("user_auth_token", "")
         default_folder = config["DEFAULT"]["default_folder"]
         default_limit = config["DEFAULT"]["default_limit"]
         default_quality = config["DEFAULT"]["default_quality"]
@@ -129,6 +164,7 @@ def main():
         no_cover = config.getboolean("DEFAULT", "no_cover")
         no_database = config.getboolean("DEFAULT", "no_database")
         app_id = config["DEFAULT"]["app_id"]
+        private_key = config["DEFAULT"].get("private_key", "")
         smart_discography = config.getboolean("DEFAULT", "smart_discography")
         folder_format = config["DEFAULT"]["folder_format"]
         track_format = config["DEFAULT"]["track_format"]
@@ -148,7 +184,32 @@ def main():
             )
 
     if arguments.reset:
-        sys.exit(_reset_config(CONFIG_FILE))
+        _reset_config(CONFIG_FILE)
+        config.read(CONFIG_FILE)
+        app_id = config["DEFAULT"]["app_id"]
+        private_key = config["DEFAULT"].get("private_key", "")
+        secrets = [
+            secret for secret in config["DEFAULT"]["secrets"].split(",") if secret
+        ]
+        qobuz = QobuzDL(
+            config["DEFAULT"]["default_folder"],
+            config["DEFAULT"]["default_quality"],
+            downloads_db=None if config.getboolean("DEFAULT", "no_database") else QOBUZ_DB,
+            folder_format=config["DEFAULT"]["folder_format"],
+            track_format=config["DEFAULT"]["track_format"],
+            smart_discography=config.getboolean("DEFAULT", "smart_discography"),
+        )
+        qobuz.app_id = app_id
+        qobuz.secrets = secrets
+        qobuz.private_key = private_key
+        token_info = qobuz.handle_oauth_login(
+            callback_url=getattr(arguments, "callback", None),
+            bind_host=getattr(arguments, "host", "0.0.0.0"),
+            bind_port=getattr(arguments, "port", 0),
+        )
+        if token_info:
+            _save_token(CONFIG_FILE, token_info)
+        sys.exit()
 
     if arguments.show_config:
         print(f"Configuation: {CONFIG_FILE}\nDatabase: {QOBUZ_DB}\n---")
@@ -177,7 +238,18 @@ def main():
         track_format=arguments.track_format or track_format,
         smart_discography=arguments.smart_discography or smart_discography,
     )
-    qobuz.initialize_client(email, password, app_id, secrets)
+    qobuz.app_id = app_id
+    qobuz.secrets = secrets
+    qobuz.private_key = private_key
+
+    if arguments.command == "oauth":
+        _handle_commands(qobuz, arguments)
+        return
+
+    if not user_auth_token:
+        sys.exit(f"{RED}No Qobuz token found. Run 'qobuz-dl -r' to authenticate.")
+
+    qobuz.initialize_client_with_token(user_auth_token, app_id, secrets, user_id or None)
 
     _handle_commands(qobuz, arguments)
 

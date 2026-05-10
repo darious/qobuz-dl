@@ -1,6 +1,10 @@
 import logging
 import os
+import socket
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 from bs4 import BeautifulSoup as bso
@@ -8,7 +12,7 @@ from pathvalidate import sanitize_filename
 
 from qobuz_dl.bundle import Bundle
 from qobuz_dl import downloader, qopy
-from qobuz_dl.color import CYAN, OFF, RED, YELLOW, DF, RESET
+from qobuz_dl.color import CYAN, GREEN, OFF, RED, YELLOW, DF, RESET
 from qobuz_dl.exceptions import NonStreamable
 from qobuz_dl.db import create_db, handle_download_id
 from qobuz_dl.utils import (
@@ -69,9 +73,21 @@ class QobuzDL:
         self.track_format = track_format
         self.smart_discography = smart_discography
 
-    def initialize_client(self, email, pwd, app_id, secrets):
-        self.client = qopy.Client(email, pwd, app_id, secrets)
+    def initialize_client_with_token(self, user_auth_token, app_id, secrets, user_id=None):
+        self.client = qopy.Client(app_id, secrets)
+        usr_info = self.client.auth_with_token(user_auth_token, user_id)
+        self.token_user_id = self.client.user_id
+        self.token_user_auth_token = self.client.uat
         logger.info(f"{YELLOW}Set max quality: {QUALITIES[int(self.quality)]}\n")
+        return usr_info
+
+    def initialize_client_with_oauth(self, code_or_url, app_id, secrets, private_key=None):
+        self.client = qopy.Client(app_id, secrets)
+        usr_info = self.client.login_with_oauth_result(code_or_url, private_key)
+        self.token_user_id = self.client.user_id
+        self.token_user_auth_token = self.client.uat
+        logger.info(f"{YELLOW}Set max quality: {QUALITIES[int(self.quality)]}\n")
+        return usr_info
 
     def get_tokens(self):
         bundle = Bundle()
@@ -79,6 +95,145 @@ class QobuzDL:
         self.secrets = [
             secret for secret in bundle.get_secrets().values() if secret
         ]  # avoid empty fields
+        self.private_key = bundle.get_private_key()
+
+    def handle_oauth_login(
+        self,
+        code_or_url=None,
+        listen=False,
+        manual=False,
+        callback_url=None,
+        bind_host="127.0.0.1",
+        bind_port=0,
+    ):
+        if not getattr(self, "app_id", None) or not getattr(self, "secrets", None):
+            logger.info(f"{YELLOW}Getting tokens. Please wait...")
+            self.get_tokens()
+
+        if not code_or_url:
+            if manual:
+                code_or_url = self._prompt_oauth_redirect()
+            elif callback_url:
+                code_or_url = self._capture_oauth_redirect(
+                    callback_url=callback_url,
+                    bind_host=bind_host,
+                    bind_port=bind_port,
+                )
+            else:
+                code_or_url = self._capture_oauth_redirect(
+                    bind_host=bind_host,
+                    bind_port=bind_port,
+                )
+
+        self.initialize_client_with_oauth(
+            code_or_url,
+            self.app_id,
+            self.secrets,
+            getattr(self, "private_key", None),
+        )
+        logger.info(f"{GREEN}OAuth login successful!")
+        return {
+            "user_id": getattr(self, "token_user_id", None),
+            "user_auth_token": getattr(self, "token_user_auth_token", None),
+            "app_id": self.app_id,
+            "app_secret": getattr(self.client, "sec", None),
+        }
+
+    def _oauth_url(self, redirect_url):
+        return (
+            "https://www.qobuz.com/signin/oauth?"
+            + urlencode(
+                {
+                    "ext_app_id": self.app_id,
+                    "redirect_url": redirect_url,
+                }
+            )
+        )
+
+    def _prompt_oauth_redirect(self):
+        redirect_url = "http://127.0.0.1:8765"
+        oauth_url = self._oauth_url(redirect_url)
+        logger.info(f"{YELLOW}Open this URL in your browser to authenticate with Qobuz:")
+        logger.info(f"{CYAN}{oauth_url}{RESET}")
+        logger.info(
+            f"{YELLOW}After login, your browser should land on 127.0.0.1 and may show a connection error."
+        )
+        logger.info(
+            f"{YELLOW}That is expected. Copy the full 127.0.0.1 URL from the address bar and paste it here."
+        )
+        code_or_url = input(f"{YELLOW}Paste final redirect URL/code:\n- ").strip()
+        if not code_or_url:
+            raise RuntimeError("No OAuth redirect URL/code was provided")
+        return code_or_url
+
+    def _capture_oauth_redirect(self, callback_url=None, bind_host="127.0.0.1", bind_port=0):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((bind_host, bind_port))
+            host, port = sock.getsockname()[:2]
+
+        if callback_url:
+            oauth_url = self._oauth_url(callback_url)
+        else:
+            redirect_host = (
+                _detect_lan_ip()
+                if bind_host in ("", "0.0.0.0")
+                else bind_host
+            )
+            oauth_url = self._oauth_url(f"http://{redirect_host}:{port}")
+
+        class OAuthHandler(BaseHTTPRequestHandler):
+            result = None
+
+            def do_GET(self):
+                parsed = urlparse(self.path)
+                params = parse_qs(parsed.query)
+                token = _first(params, "user_auth_token") or _first(params, "token")
+                code = _first(params, "code_autorisation") or _first(params, "code")
+                if token or code:
+                    OAuthHandler.result = "http://{}:{}{}".format(bind_host, port, self.path)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    self.wfile.write(
+                        b"<html><body style='font-family:system-ui;text-align:center;padding:60px'>"
+                        b"<h2>Login successful</h2>"
+                        b"<p>You can close this tab and return to your terminal.</p>"
+                        b"</body></html>"
+                    )
+                else:
+                    OAuthHandler.result = "http://{}:{}{}".format(bind_host, port, self.path)
+                    self.send_response(400)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    self.wfile.write(
+                        b"<html><body><h2>Unexpected OAuth response</h2></body></html>"
+                    )
+
+            def log_message(self, format, *args):
+                pass
+
+        logger.info(f"{YELLOW}Open this URL in your browser to authenticate with Qobuz:")
+        logger.info(f"{CYAN}{oauth_url}{RESET}")
+        logger.info(
+            f"{YELLOW}Listening on {bind_host}:{port} to capture the OAuth redirect."
+        )
+        logger.info(
+            f"{YELLOW}The browser must be able to reach the advertised callback URL."
+        )
+
+        server = HTTPServer((bind_host, port), OAuthHandler)
+        thread = threading.Thread(target=server.handle_request, daemon=True)
+        thread.start()
+
+        pasted = input(f"{YELLOW}Press Enter after login, or paste redirect URL/code:\n- ").strip()
+        server.server_close()
+        thread.join(timeout=1)
+
+        if pasted:
+            return pasted
+        if OAuthHandler.result:
+            return OAuthHandler.result
+        raise RuntimeError("No OAuth redirect was captured")
 
     def download_from_id(self, item_id, album=True, alt_path=None):
         if handle_download_id(self.downloads_db, item_id, add_id=False):
@@ -397,3 +552,29 @@ class QobuzDL:
 
         if not self.no_m3u_for_playlists:
             make_m3u(pl_directory)
+
+
+def _first(params, key):
+    values = params.get(key) or []
+    return values[0] if values else None
+
+
+def _detect_lan_ip():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+
+    try:
+        hostname = socket.gethostname()
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            if ip and not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+
+    return "127.0.0.1"

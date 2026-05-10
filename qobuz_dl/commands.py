@@ -55,6 +55,48 @@ def dl_args(subparsers):
     return download
 
 
+def oauth_args(subparsers):
+    oauth = subparsers.add_parser(
+        "oauth",
+        description="Authenticate with Qobuz OAuth and save a token session.",
+        help="OAuth login",
+    )
+    oauth.add_argument(
+        "CODE_OR_URL",
+        nargs="?",
+        help="optional pasted redirect URL, token, or OAuth code",
+    )
+    oauth.add_argument(
+        "--listen",
+        action="store_true",
+        help="start a callback server to capture the OAuth redirect (default behavior)",
+    )
+    oauth.add_argument(
+        "--manual",
+        action="store_true",
+        help="do not start a callback server; print URL and ask for pasted redirect/code",
+    )
+    oauth.add_argument(
+        "--callback",
+        dest="oauth_callback",
+        help="callback URL advertised to Qobuz, e.g. http://192.168.1.50:8765",
+    )
+    oauth.add_argument(
+        "--host",
+        dest="oauth_host",
+        default="0.0.0.0",
+        help="host/interface to bind for OAuth callback capture (default: 0.0.0.0)",
+    )
+    oauth.add_argument(
+        "--port",
+        dest="oauth_port",
+        type=int,
+        default=0,
+        help="port to bind when using --listen or --callback (default: random)",
+    )
+    return oauth
+
+
 def add_common_arg(custom_parser, default_folder, default_quality):
     custom_parser.add_argument(
         "-d",
@@ -144,6 +186,21 @@ def qobuz_dl_args(
         "-r", "--reset", action="store_true", help="create/reset config file"
     )
     parser.add_argument(
+        "--callback",
+        help="callback URL advertised to Qobuz during reset OAuth, e.g. http://192.168.1.50:8765",
+    )
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="host/interface to bind during reset OAuth callback capture (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="port to bind during reset OAuth callback capture (default: random)",
+    )
+    parser.add_argument(
         "-p",
         "--purge",
         action="store_true",
@@ -165,9 +222,10 @@ def qobuz_dl_args(
     interactive = fun_args(subparsers, default_limit)
     download = dl_args(subparsers)
     lucky = lucky_args(subparsers)
+    oauth = oauth_args(subparsers)
     [
         add_common_arg(i, default_folder, default_quality)
-        for i in (interactive, download, lucky)
+        for i in (interactive, download, lucky, oauth)
     ]
 
     return parser
