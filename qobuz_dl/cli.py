@@ -8,7 +8,12 @@ from qobuz_dl.bundle import Bundle
 from qobuz_dl.color import GREEN, RED, YELLOW
 from qobuz_dl.commands import qobuz_dl_args
 from qobuz_dl.core import QobuzDL
-from qobuz_dl.downloader import DEFAULT_FOLDER, DEFAULT_TRACK
+from qobuz_dl.downloader import (
+    DEFAULT_FOLDER,
+    DEFAULT_TRACK,
+    DownloadError,
+    DownloadSummaryError,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -124,6 +129,9 @@ def _handle_commands(qobuz, arguments):
             f"{RED}Interrupted by user\n{YELLOW}Already downloaded items will "
             "be skipped if you try to download the same releases again."
         )
+    except (DownloadError, DownloadSummaryError) as error:
+        logging.error(f"{RED}{error}")
+        sys.exit(1)
 
     finally:
         _remove_leftovers(qobuz.directory)
@@ -230,7 +238,7 @@ def main():
         arguments.embed_art or embed_art,
         ignore_singles_eps=arguments.albums_only or albums_only,
         no_m3u_for_playlists=arguments.no_m3u or no_m3u,
-        quality_fallback=not arguments.no_fallback or not no_fallback,
+        quality_fallback=not (arguments.no_fallback or no_fallback),
         cover_og_quality=arguments.og_cover or og_cover,
         no_cover=arguments.no_cover or no_cover,
         downloads_db=None if no_database or arguments.no_db else QOBUZ_DB,

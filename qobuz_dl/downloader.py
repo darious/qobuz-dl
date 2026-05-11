@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from typing import Tuple
 
 import requests
@@ -11,6 +12,15 @@ from qobuz_dl.color import OFF, GREEN, RED, YELLOW, CYAN
 from qobuz_dl.exceptions import NonStreamable
 
 QL_DOWNGRADE = "FormatRestrictedByFormatAvailability"
+DOWNLOAD_TIMEOUT = 30
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_BACKOFF_SECONDS = 2
+QUALITY_FALLBACKS = {
+    27: [27, 7, 6],
+    7: [7, 6],
+    6: [6],
+    5: [5],
+}
 # used in case of error
 DEFAULT_FORMATS = {
     "MP3": [
@@ -27,6 +37,39 @@ DEFAULT_FOLDER = "{artist} - {album} ({year}) [{bit_depth}B-{sampling_rate}kHz]"
 DEFAULT_TRACK = "{tracknumber}. {tracktitle}"
 
 logger = logging.getLogger(__name__)
+
+
+class TransferError(RuntimeError):
+    """Raised when a stream transfer fails after retry attempts."""
+
+
+class DownloadError(RuntimeError):
+    def __init__(self, track_id, track_title, quality, stage, cause):
+        self.track_id = track_id
+        self.track_title = track_title
+        self.quality = quality
+        self.stage = stage
+        self.cause = cause
+        super().__init__(
+            "{} failed at quality {} during {}: {}".format(
+                track_title,
+                quality,
+                stage,
+                cause,
+            )
+        )
+
+
+class DownloadSummaryError(RuntimeError):
+    def __init__(self, release_title, failures):
+        self.release_title = release_title
+        self.failures = failures
+        super().__init__(
+            "{} failed to download {} track(s)".format(
+                release_title,
+                len(failures),
+            )
+        )
 
 
 class Download:
@@ -113,23 +156,40 @@ class Download:
                 pass
         media_numbers = [track["media_number"] for track in meta["tracks"]["items"]]
         is_multiple = True if len([*{*media_numbers}]) > 1 else False
+        failures = []
         for i in meta["tracks"]["items"]:
-            parse = self.client.get_track_url(i["id"], fmt_id=self.quality)
-            if "sample" not in parse and parse["sampling_rate"]:
-                is_mp3 = True if int(self.quality) == 5 else False
-                self._download_and_tag(
+            try:
+                self._download_with_fallback(
                     dirn,
                     count,
-                    parse,
                     i,
                     meta,
                     False,
-                    is_mp3,
                     i["media_number"] if is_multiple else None,
                 )
-            else:
-                logger.info(f"{OFF}Demo. Skipping")
+            except DownloadError as exc:
+                failures.append(exc)
+                logger.error(f"{RED}{exc}. Continuing with remaining tracks...")
             count = count + 1
+
+        if failures:
+            logger.error(
+                f"{RED}Completed with {len(failures)}/{len(meta['tracks']['items'])} "
+                "track failure(s):"
+            )
+            for failure in failures:
+                logger.error(
+                    "{}- #{} {} ({}, quality {}): {}".format(
+                        RED,
+                        failure.track_id,
+                        failure.track_title,
+                        failure.stage,
+                        failure.quality,
+                        failure.cause,
+                    )
+                )
+            raise DownloadSummaryError(album_title, failures)
+
         logger.info(f"{GREEN}Completed")
 
     def download_track(self):
@@ -168,15 +228,12 @@ class Download:
                     dirn,
                     og_quality=self.cover_og_quality,
                 )
-            is_mp3 = True if int(self.quality) == 5 else False
-            self._download_and_tag(
+            self._download_with_fallback(
                 dirn,
                 1,
-                parse,
                 meta,
                 meta,
                 True,
-                is_mp3,
                 False,
             )
         else:
@@ -243,6 +300,87 @@ class Download:
             logger.error(f"{RED}Error tagging the file: {e}", exc_info=True)
             _remove_partial_file(filename)
             raise
+
+    def _download_with_fallback(
+        self,
+        root_dir,
+        tmp_count,
+        track_metadata,
+        album_or_track_metadata,
+        is_track,
+        multiple=None,
+    ):
+        track_id = track_metadata.get("id", self.item_id)
+        track_title = track_metadata.get("title")
+        qualities = self._quality_attempts()
+        last_error = None
+        seen_streams = set()
+
+        for index, quality in enumerate(qualities):
+            try:
+                track_url = self.client.get_track_url(track_id, fmt_id=quality)
+            except Exception as exc:
+                raise DownloadError(track_id, track_title, quality, "stream lookup", exc)
+
+            if "sample" in track_url or not track_url.get("sampling_rate"):
+                logger.info(f"{OFF}Demo. Skipping")
+                return
+
+            stream_key = (
+                track_url.get("url"),
+                track_url.get("bit_depth"),
+                track_url.get("sampling_rate"),
+            )
+            if stream_key in seen_streams:
+                continue
+            seen_streams.add(stream_key)
+
+            is_mp3 = True if int(quality) == 5 else False
+            try:
+                self._download_and_tag(
+                    root_dir,
+                    tmp_count,
+                    track_url,
+                    track_metadata,
+                    album_or_track_metadata,
+                    is_track,
+                    is_mp3,
+                    multiple,
+                )
+                if quality != int(self.quality):
+                    logger.warning(
+                        f"{YELLOW}{track_title} downloaded at fallback quality "
+                        f"{quality} after quality {self.quality} failed"
+                    )
+                return
+            except TransferError as exc:
+                last_error = exc
+                has_fallback = self.downgrade_quality and index < len(qualities) - 1
+                if has_fallback:
+                    logger.warning(
+                        f"{YELLOW}{track_title} failed at quality {quality}: {exc}. "
+                        "Trying next available quality..."
+                    )
+                    continue
+                raise DownloadError(track_id, track_title, quality, "download", exc)
+            except Exception as exc:
+                raise DownloadError(track_id, track_title, quality, "tagging", exc)
+
+        if last_error:
+            raise DownloadError(
+                track_id,
+                track_title,
+                qualities[-1],
+                "download",
+                last_error,
+            )
+        raise DownloadError(track_id, track_title, self.quality, "download", "no stream")
+
+    def _quality_attempts(self):
+        quality = int(self.quality)
+        if not self.downgrade_quality:
+            return [quality]
+        return QUALITY_FALLBACKS.get(quality, [quality])
 
     @staticmethod
     def _get_filename_attr(artist, track_metadata, track_title):
@@ -312,26 +450,65 @@ class Download:
             return ("Unknown", quality_met, None, None)
 
 
-def tqdm_download(url, fname, desc):
-    r = requests.get(url, allow_redirects=True, stream=True)
-    total = int(r.headers.get("content-length", 0))
-    download_size = 0
-    with open(fname, "wb") as file, tqdm(
-        total=total,
-        unit="iB",
-        unit_scale=True,
-        unit_divisor=1024,
-        desc=desc,
-        bar_format=CYAN + "{n_fmt}/{total_fmt} /// {desc}",
-    ) as bar:
-        for data in r.iter_content(chunk_size=1024):
-            size = file.write(data)
-            bar.update(size)
-            download_size += size
+def tqdm_download(
+    url,
+    fname,
+    desc,
+    timeout=DOWNLOAD_TIMEOUT,
+    retries=DOWNLOAD_RETRIES,
+    backoff=DOWNLOAD_BACKOFF_SECONDS,
+):
+    last_error = None
+    for attempt in range(1, retries + 1):
+        download_size = 0
+        response = None
+        try:
+            response = requests.get(
+                url,
+                allow_redirects=True,
+                stream=True,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            total = int(response.headers.get("content-length", 0))
+            with open(fname, "wb") as file, tqdm(
+                total=total,
+                unit="iB",
+                unit_scale=True,
+                unit_divisor=1024,
+                desc=desc,
+                bar_format=CYAN + "{n_fmt}/{total_fmt} /// {desc}",
+            ) as bar:
+                for data in response.iter_content(chunk_size=1024):
+                    size = file.write(data)
+                    bar.update(size)
+                    download_size += size
 
-    if total != download_size:
-        # https://stackoverflow.com/questions/69919912/requests-iter-content-thinks-file-is-complete-but-its-not
-        raise ConnectionError("File download was interrupted for " + fname)
+            if total and total != download_size:
+                # requests may stop iterating without surfacing a stream error.
+                raise TransferError("File download was interrupted for " + fname)
+            return
+        except Exception as exc:
+            last_error = exc
+            _remove_partial_file(fname)
+            if attempt >= retries:
+                break
+            logger.warning(
+                "%sDownload attempt %s/%s failed for %s: %s",
+                YELLOW,
+                attempt,
+                retries,
+                desc,
+                exc,
+            )
+            time.sleep(backoff * (2 ** (attempt - 1)))
+        finally:
+            if response is not None:
+                response.close()
+
+    raise TransferError(
+        "download failed after {} attempt(s): {}".format(retries, last_error)
+    )
 
 
 def _remove_partial_file(path):
