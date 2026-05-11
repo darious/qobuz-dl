@@ -222,7 +222,12 @@ class Download:
             logger.info(f"{OFF}{track_title} was already downloaded")
             return
 
-        tqdm_download(url, filename, filename)
+        try:
+            tqdm_download(url, filename, filename)
+        except Exception:
+            _remove_partial_file(filename)
+            raise
+
         tag_function = metadata.tag_mp3 if is_mp3 else metadata.tag_flac
         try:
             tag_function(
@@ -236,6 +241,8 @@ class Download:
             )
         except Exception as e:
             logger.error(f"{RED}Error tagging the file: {e}", exc_info=True)
+            _remove_partial_file(filename)
+            raise
 
     @staticmethod
     def _get_filename_attr(artist, track_metadata, track_title):
@@ -325,6 +332,14 @@ def tqdm_download(url, fname, desc):
     if total != download_size:
         # https://stackoverflow.com/questions/69919912/requests-iter-content-thinks-file-is-complete-but-its-not
         raise ConnectionError("File download was interrupted for " + fname)
+
+
+def _remove_partial_file(path):
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError as exc:
+        logger.warning("Failed to remove partial file %s: %s", path, exc)
 
 
 def _get_description(item: dict, track_title, multiple=None):
